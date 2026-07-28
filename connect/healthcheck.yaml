@@ -1,0 +1,19 @@
+# Phase 0 placeholder pipeline.
+# Purpose: keep the Connect container alive and expose its health endpoint
+# (:4195/ping and :4195/ready) so we can confirm the service is up.
+# Replaced by the real FHIR ingest pipeline in Phase 1.
+
+input:
+  generate:
+    interval: 30s
+    mapping: |
+      root.status = "anamnesis connect alive"
+      root.ts = now()
+
+output:
+  stdout: {}
+
+# Bind the HTTP API on all interfaces so the mapped port works.
+http:
+  address: 0.0.0.0:4195
+  enabled: true

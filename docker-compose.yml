@@ -1,0 +1,87 @@
+name: anamnesis
+
+services:
+  # ---------------------------------------------------------------------------
+  # Redpanda broker (single-node dev mode) — the buffer topic between ingest
+  # and Qdrant lives here.
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.1
+    container_name: anamnesis-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container          # sets smp=1, overprovisioned, etc.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "19092:19092"   # Kafka API  (host clients connect here)
+      - "18081:18081"   # Schema Registry
+      - "18082:18082"   # HTTP Proxy
+      - "9644:9644"     # Admin API
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Console — web UI to eyeball topics/messages. Optional but handy.
+  # ---------------------------------------------------------------------------
+  console:
+    image: docker.redpanda.com/redpandadata/console:v2.8.1
+    container_name: anamnesis-console
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console --config.filepath=/tmp/config.yml'
+    environment:
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://redpanda:8081"]
+    ports:
+      - "8080:8080"
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Connect — runs the ingest pipeline. For Phase 0 it runs a tiny
+  # keep-alive config that just exposes its health endpoint on :4195.
+  # We swap in the real FHIR pipeline in Phase 1.
+  # ---------------------------------------------------------------------------
+  connect:
+    image: docker.redpanda.com/redpandadata/connect:latest
+    container_name: anamnesis-connect
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    command: ["run", "/connect/healthcheck.yaml"]
+    ports:
+      - "4195:4195"   # Connect HTTP API + health (/ping, /ready)
+    volumes:
+      - ./connect:/connect:ro
+
+  # ---------------------------------------------------------------------------
+  # Qdrant — vector store for the embedded FHIR docs.
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: anamnesis-qdrant
+    ports:
+      - "6333:6333"   # REST API + web dashboard (/dashboard)
+      - "6334:6334"   # gRPC API (used by the Rust qdrant-client)
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+volumes:
+  redpanda-data:
+  qdrant-data:
