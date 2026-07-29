@@ -54,9 +54,10 @@ services:
       - "8080:8080"
 
   # ---------------------------------------------------------------------------
-  # Redpanda Connect — runs the ingest pipeline. For Phase 0 it runs a tiny
-  # keep-alive config that just exposes its health endpoint on :4195.
-  # We swap in the real FHIR pipeline in Phase 1.
+  # Redpanda Connect — runs the FHIR ingest pipeline (Phase 2): polls the
+  # public HAPI R4 sandbox on an interval, normalizes resources, and produces
+  # them to the `fhir.docs` topic. (Phase 0's keep-alive config is still at
+  # connect/healthcheck.yaml if needed for a bare connectivity check.)
   # ---------------------------------------------------------------------------
   connect:
     image: docker.redpanda.com/redpandadata/connect:latest
@@ -64,9 +65,31 @@ services:
     depends_on:
       redpanda:
         condition: service_healthy
-    command: ["run", "/connect/healthcheck.yaml"]
+    command: ["run", "/connect/ingest.yaml"]
     ports:
       - "4195:4195"   # Connect HTTP API + health (/ping, /ready)
+    volumes:
+      - ./connect:/connect:ro
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Connect — runs the embed & index pipeline (Phase 3): consumes
+  # `fhir.docs`, embeds each doc's `text` via TEI, upserts into Qdrant. A
+  # second `connect` instance/container so ingest and index scale and fail
+  # independently.
+  # ---------------------------------------------------------------------------
+  index:
+    image: docker.redpanda.com/redpandadata/connect:latest
+    container_name: anamnesis-index
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      embeddings:
+        condition: service_healthy
+    command: ["run", "/connect/index.yaml"]
+    ports:
+      - "4196:4196"   # Connect HTTP API + health (/ping, /ready)
     volumes:
       - ./connect:/connect:ro
 
@@ -82,6 +105,29 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
 
+  # ---------------------------------------------------------------------------
+  # Text Embeddings Inference (TEI) — local embedding server, no external
+  # API key needed. Model output is 384-dim, matching the `fhir_docs`
+  # Qdrant collection created by `make init-qdrant`.
+  # ---------------------------------------------------------------------------
+  embeddings:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
+    # TEI's CPU image only ships amd64; on Apple Silicon this runs under
+    # Rosetta emulation. Drop this line on an amd64 host.
+    platform: linux/amd64
+    container_name: anamnesis-embeddings
+    command: ["--model-id", "BAAI/bge-small-en-v1.5"]
+    ports:
+      - "8090:80"     # POST /embed
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - embeddings-data:/data
+
 volumes:
   redpanda-data:
   qdrant-data:
+  embeddings-data:

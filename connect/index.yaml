@@ -1,0 +1,58 @@
+# Phase 3 embed & index pipeline: consumes the normalized FHIR docs
+# produced by connect/ingest.yaml (Phase 2), embeds each doc's `text` via
+# the local TEI service, and upserts the vector + payload into Qdrant's
+# `fhir_docs` collection (bootstrapped by `make init-qdrant`, Phase 1).
+
+input:
+  redpanda:
+    seed_brokers: ["redpanda:9092"]
+    topics: ["fhir.docs"]
+    consumer_group: anamnesis-index
+    start_offset: earliest
+
+pipeline:
+  processors:
+    # Embed the doc's `text` field via TEI. `branch` scopes the http call's
+    # request/response so only `vector` gets merged back onto the original
+    # message — the rest of the doc (resource_type, patient_id, raw, ...)
+    # passes through untouched.
+    - branch:
+        request_map: 'root.inputs = this.text'
+        processors:
+          - http:
+              url: http://embeddings:80/embed
+              verb: POST
+              headers:
+                Content-Type: application/json
+        result_map: 'root.vector = this.index(0)'
+
+    # The qdrant output's `id` mapping runs with no message body in scope
+    # (a bug in this connect version — confirmed by testing: referencing
+    # `this` there always fails with "context was undefined", while the
+    # same reference works fine in `vector_mapping`/`payload_mapping`).
+    # Stashing the id in metadata first and reading it back via meta()
+    # works around it.
+    - mapping: 'meta resource_id = this.resource_id'
+
+output:
+  qdrant:
+    grpc_host: qdrant:6334
+    collection_name: fhir_docs
+    # Resource IDs from the HAPI sandbox are numeric strings; using them
+    # directly as the point ID makes re-ingesting the same resource an
+    # upsert rather than a duplicate.
+    id: root = meta("resource_id").number()
+    vector_mapping: root = this.vector
+    # The nested `raw` FHIR resource carries numeric fields (e.g.
+    # valueQuantity.value) as json.Number from the original HTTP response
+    # parse; the qdrant client's payload struct conversion rejects that
+    # type outright ("unable to coerce payload output type"). Round-
+    # tripping through string()/parse_json() re-decodes them as plain
+    # float64/int, which it accepts.
+    payload_mapping: root = this.without("vector").string().parse_json()
+
+# Bind the HTTP API on all interfaces (matches ingest.yaml / healthcheck.yaml),
+# on a distinct port since this runs as a second `connect` instance.
+http:
+  address: 0.0.0.0:4196
+  enabled: true

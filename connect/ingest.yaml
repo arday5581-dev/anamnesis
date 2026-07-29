@@ -1,0 +1,77 @@
+# Phase 1 FHIR ingest pipeline: poll a fixed demo cohort on the public HAPI
+# R4 sandbox, flatten the bundle into one normalized document per resource,
+# and produce each to the `fhir.docs` buffer topic for the Phase 2 embed/index
+# pipeline to consume.
+#
+# Cohort is a fixed, hardcoded patient ID list (Carlos Ramirez, Maria
+# Williams, James Anderson) chosen because they have linked Condition/
+# Observation/MedicationRequest data on the public sandbox — most patients
+# there only have a bare Patient resource. Since it's a public server its
+# data can be reset or IDs can disappear; swap in fresh IDs if `make verify`
+# stops showing a growing `fhir.docs` topic.
+
+input:
+  generate:
+    interval: 60s
+    mapping: 'root = {}'
+
+pipeline:
+  processors:
+    # A single _revinclude search pulls the patients plus every linked
+    # Condition/Observation/MedicationRequest in one request, instead of one
+    # HTTP call per patient per resource type — friendlier to the shared
+    # public sandbox.
+    - http:
+        url: >-
+          https://hapi.fhir.org/baseR4/Patient?_id=137202671,137202676,137202750&_revinclude=Condition:patient&_revinclude=Observation:patient&_revinclude=MedicationRequest:patient
+        verb: GET
+        headers:
+          Accept: application/fhir+json
+
+    # Flatten the Bundle into one normalized doc per resource. Patient
+    # name lookup is resolved here (while all entries are still one message)
+    # since post-`unarchive` each resource becomes an independent message
+    # with no visibility into its sibling Patient resource.
+    - mapping: |
+        let patients = this.entry.map_each(e -> e.resource).filter(r -> r.resourceType == "Patient").map_each(r -> {
+          "id": r.id,
+          "name": r.name.index(0).text.or(
+            [r.name.index(0).given.or([]).join(" "), r.name.index(0).family.or("")].filter(s -> s.length() > 0).join(" ")
+          ),
+        })
+
+        root = this.entry.map_each(e -> e.resource).map_each(r -> {
+          "resource_type": r.resourceType,
+          "resource_id": r.id,
+          "patient_id": if r.resourceType == "Patient" { r.id } else { r.subject.reference.or("").trim_prefix("Patient/") },
+          "raw": r,
+        }).map_each(doc -> doc.merge({
+          "patient_name": $patients.filter(p -> p.id == doc.patient_id).index(0).or({}).name.or("unknown"),
+        })).map_each(doc -> doc.merge({
+          "text": match doc.resource_type {
+            "Patient" => "Patient: " + doc.patient_name,
+            "Condition" => "Condition: " + doc.raw.code.text.or("unknown condition") + ", patient " + doc.patient_name,
+            "Observation" => "Observation: " + doc.raw.code.text.or("unknown observation") + ": " + (
+              if doc.raw.exists("valueQuantity") { doc.raw.valueQuantity.value.string() + " " + doc.raw.valueQuantity.unit.or("") }
+              else { doc.raw.valueString.or("n/a") }
+            ) + ", patient " + doc.patient_name,
+            "MedicationRequest" => "MedicationRequest: " + doc.raw.medicationCodeableConcept.text.or("unknown medication") + " [" + doc.raw.status.or("unknown") + "], patient " + doc.patient_name,
+            _ => doc.resource_type + " " + doc.resource_id,
+          },
+        }))
+
+    # Split the one array-valued message into N individual messages, one
+    # per normalized FHIR resource document.
+    - unarchive:
+        format: json_array
+
+output:
+  redpanda:
+    seed_brokers: ["redpanda:9092"]
+    topic: fhir.docs
+
+# Bind the HTTP API on all interfaces so the mapped port works (matches
+# Phase 0's healthcheck.yaml).
+http:
+  address: 0.0.0.0:4195
+  enabled: true
